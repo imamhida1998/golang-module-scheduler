@@ -2,7 +2,7 @@ package cron
 
 import (
 	"errors"
-	"log"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -25,6 +25,10 @@ type Scheduler struct {
 
 	// onError dipanggil bila job panic (opsional).
 	onError func(recovered any)
+
+	label          string
+	suppressBanner bool
+	quietLifecycle bool
 
 	mu      sync.Mutex
 	running bool
@@ -57,16 +61,45 @@ func (s *Scheduler) OnError(fn func(recovered any)) *Scheduler {
 // Expression mengembalikan ekspresi yang dipakai scheduler.
 func (s *Scheduler) Expression() *Expression { return s.expr }
 
+func (s *Scheduler) logName() string {
+	if s.label != "" {
+		return s.label
+	}
+	return "scheduler"
+}
+
+func (s *Scheduler) logStartMsg() {
+	logInfo("[START]", fmt.Sprintf("%s -> Ekspresi: %s (%s)",
+		s.logName(), s.expr.String(), s.expr.Mode()))
+	logSuccess(fmt.Sprintf("Terjadwal: %s", s.expr.Describe()))
+}
+
+func (s *Scheduler) logStopMsg(reason string) {
+	msg := fmt.Sprintf("%s -> Ekspresi: %s (%s)", s.logName(), s.expr.String(), s.expr.Mode())
+	if reason != "" {
+		msg = fmt.Sprintf("%s (%s)", msg, reason)
+	}
+	logInfo("[STOP]", msg)
+	logSuccess(fmt.Sprintf("%s berhasil dihentikan", s.logName()))
+}
+
 // Start memulai scheduler di background (non-blocking). Aman dipanggil
 // berkali-kali; pemanggilan kedua saat sudah berjalan tidak berefek.
 func (s *Scheduler) Start() error {
+	if !s.suppressBanner {
+		printBanner()
+	}
+
 	if s.expr == nil {
+		logError(ErrNilExpression.Error())
 		return ErrNilExpression
 	}
 	if s.job == nil {
+		logError(ErrNilJob.Error())
 		return ErrNilJob
 	}
 	if err := s.expr.Validate(); err != nil {
+		logError(err.Error())
 		return err
 	}
 
@@ -78,6 +111,10 @@ func (s *Scheduler) Start() error {
 	s.running = true
 	s.stop = make(chan struct{})
 	s.mu.Unlock()
+
+	if !s.quietLifecycle {
+		s.logStartMsg()
+	}
 
 	s.wg.Add(1)
 	go s.run()
@@ -94,9 +131,14 @@ func (s *Scheduler) Stop() {
 	}
 	s.running = false
 	close(s.stop)
+	quiet := s.quietLifecycle
 	s.mu.Unlock()
 
 	s.wg.Wait()
+
+	if !quiet {
+		s.logStopMsg("")
+	}
 }
 
 // Running melaporkan apakah scheduler sedang berjalan.
@@ -139,7 +181,8 @@ func (s *Scheduler) runCalendar() {
 		now := time.Now().In(s.loc)
 		next, ok := s.expr.NextRun(now)
 		if !ok {
-			return // tidak ada jadwal berikutnya (mis. one-shot yang sudah lewat)
+			s.finishNaturally("tidak ada jadwal berikutnya")
+			return
 		}
 
 		timer := time.NewTimer(next.Sub(now))
@@ -150,25 +193,44 @@ func (s *Scheduler) runCalendar() {
 		case <-timer.C:
 			s.safeRun()
 			if s.expr.IsOneShot() {
+				s.finishNaturally("one-shot selesai")
 				return
 			}
 		}
 	}
 }
 
+func (s *Scheduler) finishNaturally(reason string) {
+	s.mu.Lock()
+	if !s.running {
+		s.mu.Unlock()
+		return
+	}
+	s.running = false
+	quiet := s.quietLifecycle
+	s.mu.Unlock()
+
+	if !quiet {
+		s.logStopMsg(reason)
+	}
+}
+
 // safeRun menjalankan job dan menangkap panic agar scheduler tetap hidup.
 func (s *Scheduler) safeRun() {
+	logInfo("[RUN]", fmt.Sprintf("%s -> menjalankan job", s.logName()))
+
 	defer func() {
 		if r := recover(); r != nil {
+			logError(fmt.Sprintf("%s panic: %v", s.logName(), r))
 			s.mu.Lock()
 			h := s.onError
 			s.mu.Unlock()
 			if h != nil {
 				h(r)
-			} else {
-				log.Printf("cron: job panic: %v", r)
 			}
+			return
 		}
+		logSuccess(fmt.Sprintf("%s selesai", s.logName()))
 	}()
 	s.job()
 }

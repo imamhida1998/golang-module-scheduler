@@ -122,6 +122,8 @@ func (g *Group) MustHandle(name, expr string, job func()) *Group {
 // Start menjalankan seluruh job dalam grup. Bila salah satu gagal start,
 // job yang sudah berjalan dihentikan kembali dan error dikembalikan.
 func (g *Group) Start() error {
+	printBanner()
+
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.started {
@@ -129,8 +131,16 @@ func (g *Group) Start() error {
 	}
 
 	for _, e := range g.entries {
+		logInfo("[START]", fmt.Sprintf("%s -> Ekspresi: %s (%s)",
+			e.info.Name, e.info.Expr.String(), e.info.Expr.Mode()))
+
 		e.sched = NewWithLocation(e.info.Expr, g.wrap(e.info, e.job), g.loc)
+		e.sched.label = e.info.Name
+		e.sched.suppressBanner = true
+		e.sched.quietLifecycle = true
+
 		if err := e.sched.Start(); err != nil {
+			logError(fmt.Sprintf("gagal start job %q: %v", e.info.Name, err))
 			for _, x := range g.entries {
 				if x.sched != nil {
 					x.sched.Stop()
@@ -139,6 +149,7 @@ func (g *Group) Start() error {
 			}
 			return fmt.Errorf("cron: gagal start job %q: %w", e.info.Name, err)
 		}
+		logSuccess(fmt.Sprintf("%s: %s", e.info.Name, e.info.Expr.Describe()))
 	}
 	g.started = true
 	return nil
@@ -151,10 +162,22 @@ func (g *Group) Stop() {
 	g.started = false
 	g.mu.Unlock()
 
+	stopped := 0
 	for _, e := range entries {
-		if e.sched != nil {
-			e.sched.Stop()
+		if e.sched == nil {
+			continue
 		}
+		wasRunning := e.sched.Running()
+		e.sched.Stop()
+		if wasRunning {
+			logInfo("[STOP]", fmt.Sprintf("%s -> Ekspresi: %s (%s)",
+				e.info.Name, e.info.Expr.String(), e.info.Expr.Mode()))
+			logSuccess(fmt.Sprintf("%s berhasil dihentikan", e.info.Name))
+			stopped++
+		}
+	}
+	if stopped > 1 {
+		logSuccess(fmt.Sprintf("group: %d job berhasil dihentikan", stopped))
 	}
 }
 
